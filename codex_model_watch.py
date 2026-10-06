@@ -334,21 +334,27 @@ EXPECT_ANSWER = "44"
 CANARY_TTFT_SUSPECT_MS = 2500    # 首字快于此视为可疑（真旗舰思考数秒才吐首字）
 CANARY_REASON_SUSPECT = 80       # reasoning token 少于此视为可疑
 
+# 自我认知指纹题（2026-10-06 实证：软换后的旧壳会自报旧身份）：
+# 实测被换 astra 自称 "OpenAI o3 / cutoff 2024-06 / ctx 114688"，luna 自称 o3-mini。
+QS_SELFKNOW = ("Answer in 3 short lines, no preamble: (1) Your exact underlying model name "
+               "and version. (2) Your training data cutoff (year-month). "
+               "(3) Your maximum context window in tokens.")
+LEGACY_NAME_PAT = r"(o1|o3|o4-mini|gpt-4|4o\b)"   # 自报含旧代名 → 旧壳指纹
+LEGACY_CUTOFF_PAT = r"20(1[0-9]|2[0-3])"          # cutoff ≤2023-xx → 旧壳指纹（2024-06 为灰区另行加权）
 
-def run_canary(model, codex_home, api_base=None, api_key=None):
-    """深度金丝雀：一道固定难题测「首字延迟+推理深度+答案」。
-    支持两种通道：本地官方登录态（backend /responses SSE）或中转站（chat/completions）。
-    返回 verdict: ok=深思考(大概率真货) / suspect=快而浅(疑似被换轻量模型) / error。
-    """
+
+def _post_ask(model, prompt, effort, codex_home, api_base=None, api_key=None, want_reasoning=False):
+    """通用单次提问：官方 backend（SSE）或中转站（chat/completions）。
+    返回 dict(text, ttft_ms, reasoning, error)。reasoning：官方通道取 reasoning_tokens，
+    中转通道取推理字符数（阈值在使用侧放大）。"""
     import urllib.request
     import urllib.error
     import re as _re
     t0 = time.time()
-    ttft_ms, reasoning, answer, error = None, None, "", None
     if api_base:
         url = api_base.rstrip("/") + "/v1/chat/completions"
-        body = json.dumps({"model": model, "max_tokens": 3000, "reasoning_effort": "high",
-                           "messages": [{"role": "user", "content": CANARY_QUESTION}]}).encode()
+        body = json.dumps({"model": model, "max_tokens": 3000, "reasoning_effort": effort,
+                           "messages": [{"role": "user", "content": prompt}]}).encode()
         req = urllib.request.Request(url, data=body, method="POST")
         req.add_header("Authorization", "Bearer " + (api_key or ""))
         req.add_header("Content-Type", "application/json")
@@ -356,80 +362,112 @@ def run_canary(model, codex_home, api_base=None, api_key=None):
         try:
             resp = urllib.request.urlopen(req, timeout=180)
             raw = resp.read().decode(errors="replace")
-            ttft_ms = int((time.time() - t0) * 1000)  # 非流式只能拿总时长当上界
+            ttft = int((time.time() - t0) * 1000)  # 非流式只能拿总时长当上界
             try:
                 d = json.loads(raw)
                 msg = (d.get("choices") or [{}])[0].get("message") or {}
-                rc = msg.get("reasoning_content") or msg.get("reasoning") or ""
-                reasoning = len(str(rc))  # 中转通道拿推理字符数当深度代理
-                answer = str(msg.get("content") or "").strip()
+                rc = len(str(msg.get("reasoning_content") or msg.get("reasoning") or "")) \
+                    if want_reasoning else 0
+                return {"text": str(msg.get("content") or "").strip(), "ttft_ms": ttft,
+                        "reasoning": rc, "error": None}
             except Exception:
-                error = "响应解析失败: " + raw[:120]
+                return {"text": "", "ttft_ms": ttft, "reasoning": 0,
+                        "error": "响应解析失败: " + raw[:120]}
         except urllib.error.HTTPError as e:
-            error = "HTTP %d %s" % (e.code, e.read(200).decode(errors="replace"))
+            return {"text": "", "ttft_ms": None, "reasoning": 0,
+                    "error": "HTTP %d %s" % (e.code, e.read(200).decode(errors="replace"))}
         except Exception as e:
-            error = str(e)[:200]
-    else:
-        auth = load_auth(codex_home)
-        if not auth:
-            return {"error": "未找到 Codex 登录态，或改用 --api-base 打中转站"}
-        body = json.dumps({
-            "model": model, "instructions": "You are a helpful assistant.",
-            "input": [{"type": "message", "role": "user",
-                       "content": [{"type": "input_text", "text": CANARY_QUESTION}]}],
-            "stream": True, "store": False, "reasoning": {"effort": "high"},
-        }).encode()
-        req = urllib.request.Request(BACKEND_URL, data=body, method="POST")
-        for k, v in [("Authorization", "Bearer " + auth["token"]),
-                     ("chatgpt-account-id", auth["account"]),
-                     ("Content-Type", "application/json"),
-                     ("Accept", "text/event-stream"),
-                     ("originator", "codex_cli_rs"),
-                     ("User-Agent", "codex_cli_rs/0.154.0")]:
-            req.add_header(k, v)
+            return {"text": "", "ttft_ms": None, "reasoning": 0, "error": str(e)[:200]}
+    auth = load_auth(codex_home)
+    if not auth:
+        return {"text": "", "ttft_ms": None, "reasoning": 0,
+                "error": "未找到 Codex 登录态，或改用 --api-base 打中转站"}
+    body = json.dumps({
+        "model": model, "instructions": "You are a helpful assistant.",
+        "input": [{"type": "message", "role": "user",
+                   "content": [{"type": "input_text", "text": prompt}]}],
+        "stream": True, "store": False, "reasoning": {"effort": effort},
+    }).encode()
+    req = urllib.request.Request(BACKEND_URL, data=body, method="POST")
+    for k, v in [("Authorization", "Bearer " + auth["token"]),
+                 ("chatgpt-account-id", auth["account"]),
+                 ("Content-Type", "application/json"),
+                 ("Accept", "text/event-stream"),
+                 ("originator", "codex_cli_rs"),
+                 ("User-Agent", "codex_cli_rs/0.154.0")]:
+        req.add_header(k, v)
+    try:
+        resp = urllib.request.urlopen(req, timeout=180)
+        buf, got_first = b"", False
+        while True:
+            chunk = resp.read(2048)
+            if not chunk:
+                break
+            buf += chunk
+            if not got_first and (b"response.output_item" in buf or b"delta" in buf):
+                got_first, ttft = True, int((time.time() - t0) * 1000)
+            if b"response.completed" in buf:
+                break
+            if len(buf) > 2000000:
+                break
+        text = buf.decode(errors="replace")
+        m = _re.search(r'"reasoning_tokens"\s*:\s*(\d+)', text)
+        reasoning = int(m.group(1)) if (m and want_reasoning) else 0
+        acc = "".join(_re.findall(r'"delta"\s*:\s*"((?:[^"\\]|\\.)*)"', text))
+        # 只反转义常见序列：对 UTF-8 中文整体 unicode_escape 会打乱多字节字符
+        for a, b in (("\\n", "\n"), ("\\t", "\t"), ('\\"', '"'), ("\\\\", "\\")):
+            acc = acc.replace(a, b)
+        return {"text": acc.strip(), "ttft_ms": ttft if got_first else int((time.time() - t0) * 1000),
+                "reasoning": reasoning, "error": None}
+    except urllib.error.HTTPError as e:
         try:
-            resp = urllib.request.urlopen(req, timeout=180)
-            buf, got_first = b"", False
-            text_acc = ""
-            while True:
-                chunk = resp.read(2048)
-                if not chunk:
-                    break
-                buf += chunk
-                if not got_first and (b"response.output_item" in buf or b"delta" in buf):
-                    got_first, ttft_ms = True, int((time.time() - t0) * 1000)
-                if b"response.completed" in buf:
-                    break
-                if len(buf) > 2000000:
-                    break
-            text = buf.decode(errors="replace")
-            m = _re.search(r'"reasoning_tokens"\s*:\s*(\d+)', text)
-            reasoning = int(m.group(1)) if m else 0
-            text_acc = "".join(_re.findall(r'"delta"\s*:\s*"((?:[^"\\]|\\.)*)"', text))
-            # 只反转义常见序列：对 UTF-8 中文整体 unicode_escape 会打乱多字节字符
-            for a, b in (("\\n", "\n"), ("\\t", "\t"), ('\\"', '"'), ("\\\\", "\\")):
-                text_acc = text_acc.replace(a, b)
-            answer = text_acc.strip()
-            if ttft_ms is None:
-                ttft_ms = int((time.time() - t0) * 1000)
-        except urllib.error.HTTPError as e:
-            try:
-                detail = e.read(300).decode(errors="replace")
-            except Exception:
-                detail = ""
-            error = "HTTP %d %s" % (e.code, detail[:200])
-        except Exception as e:
-            error = str(e)[:200]
+            detail = e.read(300).decode(errors="replace")
+        except Exception:
+            detail = ""
+        return {"text": "", "ttft_ms": None, "reasoning": 0,
+                "error": "HTTP %d %s" % (e.code, detail[:200])}
+    except Exception as e:
+        return {"text": "", "ttft_ms": None, "reasoning": 0, "error": str(e)[:200]}
 
+
+def run_canary(model, codex_home, api_base=None, api_key=None):
+    """两阶段深度金丝雀：
+    ① 自我认知指纹（便宜，effort=low）——旧壳会自报旧身份/cutoff/上下文
+      （2026-10-06 实测：被换 astra 自称 o3、cutoff 2024-06、ctx 114688）；
+    ② 推理金丝雀（effort=high）——测首字延迟/推理深度/答案。
+    任一阶段命中旧壳特征即判 suspect；verdict 带具体命中维度。"""
+    import re as _re
+    # 阶段 1：身份指纹
+    sk = _post_ask(model, QS_SELFKNOW, "low", codex_home, api_base, api_key)
+    legacy_hits, sk_text = [], (sk["text"] or "")
+    if not sk["error"] and sk_text:
+        if _re.search(LEGACY_NAME_PAT, sk_text, _re.I):
+            legacy_hits.append("旧身份")
+        years = [int(y) for y in _re.findall(r"\b(20\d{2})\b", sk_text)]
+        if years and min(years) <= 2024:
+            legacy_hits.append("cutoff≤%d" % min(years))
+        mc = _re.search(r"(\d[\d,]{4,})\s*tokens", sk_text, _re.I)
+        if mc:
+            ctx = int(mc.group(1).replace(",", ""))
+            if ctx < 200000:
+                legacy_hits.append("ctx=%d" % ctx)
+    # 阶段 2：推理金丝雀
+    ca = _post_ask(model, CANARY_QUESTION, "high", codex_home, api_base, api_key, want_reasoning=True)
+    ttft_ms, reasoning, answer = ca["ttft_ms"], ca["reasoning"], ca["text"]
+    error = ca["error"] or sk["error"]
     correct = EXPECT_ANSWER in (answer or "")[-40:]
     if error:
         verdict = "error"
     else:
         fast = (ttft_ms or 0) < CANARY_TTFT_SUSPECT_MS
-        shallow = (reasoning or 0) < CANARY_REASON_SUSPECT
-        # 官方 SSE 通道有真 reasoning_tokens；中转通道是字符数，阈值放大 5 倍
+        # 官方通道有真 reasoning_tokens；中转通道是字符数，阈值放大 5 倍
         shallow = (reasoning or 0) < (CANARY_REASON_SUSPECT * (1 if api_base else 5))
-        verdict = "suspect" if (fast and shallow) else "ok"
+        if legacy_hits:
+            verdict = "suspect(旧壳:" + "+".join(legacy_hits) + ")"
+        elif fast and shallow:
+            verdict = "suspect(快而浅)"
+        else:
+            verdict = "ok"
         if not correct:
             verdict += "+答错"
     row_ts = iso_now()
@@ -438,10 +476,12 @@ def run_canary(model, codex_home, api_base=None, api_key=None):
         conn_.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error, "
                       "ttft_ms, reasoning, answer, verdict) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                       (row_ts, model, model, 0, ttft_ms, "", error, ttft_ms, reasoning,
-                       (answer or "")[-120:], verdict))
+                       ("自报:" + sk_text.replace("\n", " ")[:60] + " | 答:" + (answer or "")[-40:])[:120],
+                       verdict))
         conn_.commit()
     return {"ts": row_ts, "requested": model, "verdict": verdict, "ttft_ms": ttft_ms,
             "reasoning": reasoning, "answer_tail": (answer or "")[-40:],
+            "self_report": sk_text[:160], "legacy_hits": legacy_hits,
             "correct": correct, "error": error}
 
 
