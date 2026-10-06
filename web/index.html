@@ -297,7 +297,11 @@ async function runCanary(){
     if(r.error){out.innerHTML='<span style="color:var(--fail)">金丝雀失败：'+r.error+'</span>';}
     else{
       const bad=r.verdict.startsWith('suspect');
-      out.innerHTML=(bad?'<span style="color:var(--fail)">⚠ 疑似被换轻量模型</span>':'<span style="color:var(--ok)">✓ 深度正常（大概率真货）</span>')+
+      const unk=r.verdict.startsWith('unknown');
+      const head=bad?'<span style="color:var(--fail)">⚠ 疑似被换模型</span>'
+        :(unk?'<span style="color:var(--warn)">⚠ 无法定真伪（指纹未取到，别当真货）</span>'
+             :'<span style="color:var(--ok)">✓ 指纹干净且深思考（真货特征）</span>');
+      out.innerHTML=head+
         `：首字 ${r.ttft_ms}ms · 推理量 ${r.reasoning??'?'} · 答案${r.correct?'正确 ✓':'错误 ✗'} —— 判定 ${r.verdict}`;
     }
     load();

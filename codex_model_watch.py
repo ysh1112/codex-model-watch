@@ -462,8 +462,13 @@ def run_canary(model, codex_home, api_base=None, api_key=None):
         fast = (ttft_ms or 0) < CANARY_TTFT_SUSPECT_MS
         # 官方通道有真 reasoning_tokens；中转通道是字符数，阈值放大 5 倍
         shallow = (reasoning or 0) < (CANARY_REASON_SUSPECT * (1 if api_base else 5))
+        # 指纹取不到（自报拒答/无年份/无身份）≠ 真货：2026-10-06 实测假阴性——
+        # 一轮自报全拒答被误判 ok，外部指纹实测仍是 Luna 顶包。指纹缺失只能判 unknown。
+        fingerprint_missing = not legacy_hits and not _re.findall(r"\b(20\d{2})\b", sk_text)
         if legacy_hits:
             verdict = "suspect(旧壳:" + "+".join(legacy_hits) + ")"
+        elif fingerprint_missing:
+            verdict = "unknown(自报未取到，深度不可单独定真伪)"
         elif fast and shallow:
             verdict = "suspect(快而浅)"
         else:
