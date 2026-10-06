@@ -15,6 +15,13 @@ codex-model-watch —— 本地监控 Codex 的模型使用、额度水位、容
      chatgpt.com/backend-api/codex/responses 发一条最小请求，读取 SSE
      response.created 事件里服务端实际派出的模型，即可即时验证「请求 X 会被派什么」。
      每次探针只消耗极少量额度，可手动触发也可定时执行。
+     ⚠ 2026-10 实测：服务端自报模型已不可信（被软换时自报仍为请求模型名），
+     快探针只能证明"链路活着"，不能证明"货是真的"。
+  3. 深度金丝雀（canary，2026-10 新增）：发一道固定的多步推理题（effort=high），
+     测「首字延迟 + 推理深度 + 答案正确性」。真旗舰模型慢而深（TTFT 数秒、
+     reasoning 上百 token），被换成的轻量模型秒回浅答。这是目前唯一能识破
+     "自报造假型软换"的本地手段（与 BazaarLink 行为指纹同原理）。
+     支持直接打中转站（--api-base/--api-key），可监控号池任意入口。
 
 所有数据只存在本机（SQLite），面板为本地网页，没有任何遥测。
 """
@@ -67,6 +74,15 @@ def db_connect(db_path):
     CREATE TABLE IF NOT EXISTS threads(
         thread_id TEXT PRIMARY KEY, requested TEXT);
     """)
+    # 2026-10 金丝雀列迁移：老库 ALTER 补列（新库 executescript 里没放，统一走这里）
+    for ddl in ("ALTER TABLE probes ADD COLUMN ttft_ms INTEGER",
+                "ALTER TABLE probes ADD COLUMN reasoning INTEGER",
+                "ALTER TABLE probes ADD COLUMN answer TEXT",
+                "ALTER TABLE probes ADD COLUMN verdict TEXT"):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass  # 列已存在
     return conn
 
 
@@ -306,6 +322,129 @@ def run_probe(codex_home, model):
             "latency_ms": latency, "safety_header": safety, "error": error}
 
 
+# ---------------------------------------------------------------- 深度金丝雀
+
+# 固定推理题：答案唯一可校验（C(4,3)=4 全偶 + 4*C(5,2)=40 一偶两奇 = 44），
+# 换题要同步改 EXPECT_ANSWER。深度判据与题目无关（TTFT + 推理量）。
+CANARY_QUESTION = ("袋中有编号 1-9 的九个球（奇数号 5 个、偶数号 4 个）。"
+                   "一次性取出 3 个，取法共有多少种使得三球编号之和为偶数？"
+                   "先推理，最后一行只写答案数字。")
+EXPECT_ANSWER = "44"
+# 阈值初版（可按观测校准）：轻量模型的特征是"秒回 + 几乎不推理"。
+CANARY_TTFT_SUSPECT_MS = 2500    # 首字快于此视为可疑（真旗舰思考数秒才吐首字）
+CANARY_REASON_SUSPECT = 80       # reasoning token 少于此视为可疑
+
+
+def run_canary(model, codex_home, api_base=None, api_key=None):
+    """深度金丝雀：一道固定难题测「首字延迟+推理深度+答案」。
+    支持两种通道：本地官方登录态（backend /responses SSE）或中转站（chat/completions）。
+    返回 verdict: ok=深思考(大概率真货) / suspect=快而浅(疑似被换轻量模型) / error。
+    """
+    import urllib.request
+    import urllib.error
+    import re as _re
+    t0 = time.time()
+    ttft_ms, reasoning, answer, error = None, None, "", None
+    if api_base:
+        url = api_base.rstrip("/") + "/v1/chat/completions"
+        body = json.dumps({"model": model, "max_tokens": 3000, "reasoning_effort": "high",
+                           "messages": [{"role": "user", "content": CANARY_QUESTION}]}).encode()
+        req = urllib.request.Request(url, data=body, method="POST")
+        req.add_header("Authorization", "Bearer " + (api_key or ""))
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", "codex_cli_rs/0.155.0")
+        try:
+            resp = urllib.request.urlopen(req, timeout=180)
+            raw = resp.read().decode(errors="replace")
+            ttft_ms = int((time.time() - t0) * 1000)  # 非流式只能拿总时长当上界
+            try:
+                d = json.loads(raw)
+                msg = (d.get("choices") or [{}])[0].get("message") or {}
+                rc = msg.get("reasoning_content") or msg.get("reasoning") or ""
+                reasoning = len(str(rc))  # 中转通道拿推理字符数当深度代理
+                answer = str(msg.get("content") or "").strip()
+            except Exception:
+                error = "响应解析失败: " + raw[:120]
+        except urllib.error.HTTPError as e:
+            error = "HTTP %d %s" % (e.code, e.read(200).decode(errors="replace"))
+        except Exception as e:
+            error = str(e)[:200]
+    else:
+        auth = load_auth(codex_home)
+        if not auth:
+            return {"error": "未找到 Codex 登录态，或改用 --api-base 打中转站"}
+        body = json.dumps({
+            "model": model, "instructions": "You are a helpful assistant.",
+            "input": [{"type": "message", "role": "user",
+                       "content": [{"type": "input_text", "text": CANARY_QUESTION}]}],
+            "stream": True, "store": False, "reasoning": {"effort": "high"},
+        }).encode()
+        req = urllib.request.Request(BACKEND_URL, data=body, method="POST")
+        for k, v in [("Authorization", "Bearer " + auth["token"]),
+                     ("chatgpt-account-id", auth["account"]),
+                     ("Content-Type", "application/json"),
+                     ("Accept", "text/event-stream"),
+                     ("originator", "codex_cli_rs"),
+                     ("User-Agent", "codex_cli_rs/0.154.0")]:
+            req.add_header(k, v)
+        try:
+            resp = urllib.request.urlopen(req, timeout=180)
+            buf, got_first = b"", False
+            text_acc = ""
+            while True:
+                chunk = resp.read(2048)
+                if not chunk:
+                    break
+                buf += chunk
+                if not got_first and (b"response.output_item" in buf or b"delta" in buf):
+                    got_first, ttft_ms = True, int((time.time() - t0) * 1000)
+                if b"response.completed" in buf:
+                    break
+                if len(buf) > 2000000:
+                    break
+            text = buf.decode(errors="replace")
+            m = _re.search(r'"reasoning_tokens"\s*:\s*(\d+)', text)
+            reasoning = int(m.group(1)) if m else 0
+            text_acc = "".join(_re.findall(r'"delta"\s*:\s*"((?:[^"\\]|\\.)*)"', text))
+            # 只反转义常见序列：对 UTF-8 中文整体 unicode_escape 会打乱多字节字符
+            for a, b in (("\\n", "\n"), ("\\t", "\t"), ('\\"', '"'), ("\\\\", "\\")):
+                text_acc = text_acc.replace(a, b)
+            answer = text_acc.strip()
+            if ttft_ms is None:
+                ttft_ms = int((time.time() - t0) * 1000)
+        except urllib.error.HTTPError as e:
+            try:
+                detail = e.read(300).decode(errors="replace")
+            except Exception:
+                detail = ""
+            error = "HTTP %d %s" % (e.code, detail[:200])
+        except Exception as e:
+            error = str(e)[:200]
+
+    correct = EXPECT_ANSWER in (answer or "")[-40:]
+    if error:
+        verdict = "error"
+    else:
+        fast = (ttft_ms or 0) < CANARY_TTFT_SUSPECT_MS
+        shallow = (reasoning or 0) < CANARY_REASON_SUSPECT
+        # 官方 SSE 通道有真 reasoning_tokens；中转通道是字符数，阈值放大 5 倍
+        shallow = (reasoning or 0) < (CANARY_REASON_SUSPECT * (1 if api_base else 5))
+        verdict = "suspect" if (fast and shallow) else "ok"
+        if not correct:
+            verdict += "+答错"
+    row_ts = iso_now()
+    conn_ = db_connect(db_path())
+    with g_lock:
+        conn_.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error, "
+                      "ttft_ms, reasoning, answer, verdict) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                      (row_ts, model, model, 0, ttft_ms, "", error, ttft_ms, reasoning,
+                       (answer or "")[-120:], verdict))
+        conn_.commit()
+    return {"ts": row_ts, "requested": model, "verdict": verdict, "ttft_ms": ttft_ms,
+            "reasoning": reasoning, "answer_tail": (answer or "")[-40:],
+            "correct": correct, "error": error}
+
+
 # ---------------------------------------------------------------- 聚合输出
 
 def api_data(conn, days=0):
@@ -342,7 +481,8 @@ def api_data(conn, days=0):
     quota_latest = q("SELECT * FROM quota ORDER BY ts DESC LIMIT 1")
     quota_hist = q("SELECT ts, primary_used, secondary_used FROM quota ORDER BY ts DESC LIMIT 48")
     probes = q("SELECT * FROM probes ORDER BY ts DESC LIMIT 100")
-    probe_summary = conn.execute("""SELECT COUNT(*) n, COALESCE(SUM(swapped),0) swapped
+    probe_summary = conn.execute("""SELECT COUNT(*) n, COALESCE(SUM(swapped),0) swapped,
+                                    COALESCE(SUM(CASE WHEN verdict LIKE 'suspect%' THEN 1 ELSE 0 END),0) suspect
                                     FROM probes""").fetchone()
     total_models = sum(m["turns"] for m in models) or 1
     for m in models:
@@ -359,7 +499,8 @@ def api_data(conn, days=0):
         "quota": {"latest": quota_latest[0] if quota_latest else None,
                   "history": list(reversed(quota_hist))},
         "probes": probes,
-        "probe_summary": {"total": probe_summary["n"], "swapped": probe_summary["swapped"]},
+        "probe_summary": {"total": probe_summary["n"], "swapped": probe_summary["swapped"],
+                          "suspect": probe_summary["suspect"]},
     }
 
 
@@ -485,7 +626,12 @@ class Handler(BaseHTTPRequestHandler):
             if not model:
                 self._json({"error": "缺少 model"}, 400)
                 return
-            result = run_probe(g_args.codex_home, model)
+            if body.get("canary"):
+                result = run_canary(model, g_args.codex_home,
+                                    api_base=body.get("api_base") or g_args.api_base,
+                                    api_key=body.get("api_key") or g_args.api_key)
+            else:
+                result = run_probe(g_args.codex_home, model)
             self._json(result)
             return
         self.send_response(404)
@@ -520,6 +666,8 @@ def main():
     ap.add_argument("--demo", action="store_true", help="使用内置演示数据（不读取真实日志）")
     ap.add_argument("--scan-only", action="store_true", help="只扫描解析并打印摘要，不启动网页")
     ap.add_argument("--no-open", action="store_true", help="启动后不自动打开浏览器")
+    ap.add_argument("--api-base", default="", help="金丝雀探针打中转站地址（如 https://api.funyoo.uk），留空用本地官方登录态")
+    ap.add_argument("--api-key", default="", help="中转站 API key（配合 --api-base）")
     g_args = ap.parse_args()
     g_state["demo"] = g_args.demo
 

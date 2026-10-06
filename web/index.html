@@ -121,7 +121,8 @@
       <span class="hint">请求模型</span>
       <input class="pmodel" id="pModel" placeholder="例如 gpt-6-astra">
       <button class="pgo" id="pGo" onclick="runProbe()">立即探测</button>
-      <span class="hint">用本地 Codex 登录态发一条最小请求，读取服务端实际派出的模型；每次仅消耗极少量额度</span>
+      <button class="pgo" id="pCanary" onclick="runCanary()">🔍 深度金丝雀</button>
+      <span class="hint">快探针读自报模型名（软换时不可信）；金丝雀测推理深度（能识破自报造假）</span>
     </div>
     <div id="probeOut"></div>
     <div class="legend"><span><i class="sq ok"></i>一致</span><span><i class="sq swap"></i>被偷换</span><span><i class="sq err"></i>失败/无结果</span><span style="margin-left:auto">最近 60 次探测</span></div>
@@ -229,18 +230,20 @@ function render(d){
       <td><span class="badge ${e.error_kind==='capacity'||e.error_kind==='server_overloaded'?'b-bad':'b-warn'}">${e.error_kind}</span></td>
       <td style="text-align:left;color:var(--dim);font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(e.error_msg||'').replace(/"/g,'')}">${e.error_msg||''}</td></tr>`).join(''):'<tr><td style="color:var(--ok)">没有错误 ✓</td></tr>');
   const probes=d.probes||[];
-  $('#pNote').textContent=`共 ${fmt(ps.total||0)} 次探测 · 偷换 ${fmt(ps.swapped||0)} 次`;
+  $('#pNote').textContent=`共 ${fmt(ps.total||0)} 次探测 · 偷换 ${fmt(ps.swapped||0)} · 金丝雀可疑 ${fmt(ps.suspect||0)}`;
   $('#pSquares').innerHTML=probes.slice(0,60).reverse().map(p=>{
-    const cls=p.swapped?'swap':(p.served?'ok':'err');
-    const info=`${String(p.ts).slice(5,16).replace('T',' ')} · 请求 ${p.requested} → 实际 ${p.served||p.error||'?'}`;
+    const cls=p.verdict&&p.verdict.startsWith('suspect')?'swap':(p.swapped?'swap':(p.served?'ok':'err'));
+    const info=`${String(p.ts).slice(5,16).replace('T',' ')} · 请求 ${p.requested} → 实际 ${p.served||p.error||'?'}${p.verdict?' · '+p.verdict:''}`;
     return `<span class="sq ${cls}" title="${info}"></span>`;}).join('')||'<span class="hint">还没有探测记录</span>';
-  $('#tProbe').innerHTML='<tr><th>时间</th><th>请求模型</th><th>实际派出</th><th>结果</th><th>耗时</th></tr>'+
+  $('#tProbe').innerHTML='<tr><th>时间</th><th>请求模型</th><th>实际派出</th><th>结果</th><th>耗时</th><th>金丝雀</th></tr>'+
     (probes.length?probes.slice(0,15).map(p=>{
       const sw=p.swapped;
+      const canary=p.verdict?(`<span class="badge ${p.verdict.startsWith('suspect')?'b-bad':'b-ok'}">${p.verdict}</span>`+
+        (p.ttft_ms?`<span style="color:var(--dim);font-size:11px"> ${p.ttft_ms}ms/推理${p.reasoning??'?'}</span>`:'')):'—';
       return `<tr><td>${String(p.ts).slice(5,16).replace('T',' ')}</td><td>${modelBadge(p.requested)}</td>
         <td style="color:${sw?'var(--fail)':'var(--ok)'}">${p.served||(p.error?'<span style="color:var(--dim)">'+(p.error||'').slice(0,40)+'</span>':'?')}</td>
         <td>${sw?'<span class="badge b-bad">被偷换</span>':(p.served?'<span class="badge b-ok">一致</span>':'<span class="badge b-off">'+(p.error?'失败':'?')+'</span>')}</td>
-        <td>${p.latency_ms?fmtDur(p.latency_ms):'—'}</td></tr>`;}).join(''):'<tr><td style="color:var(--dim)">还没有探测记录 —— 在上面输入模型名点「立即探测」试试</td></tr>');
+        <td>${p.latency_ms?fmtDur(p.latency_ms):'—'}</td><td>${canary}</td></tr>`;}).join(''):'<tr><td style="color:var(--dim)">还没有探测记录 —— 在上面输入模型名点「立即探测」试试</td></tr>');
 }
 
 async function load(){
@@ -279,6 +282,27 @@ async function runProbe(){
     load();
   }catch(e){out.innerHTML='<span style="color:var(--fail)">请求失败：'+e+'</span>';}
   btn.disabled=false;btn.textContent='立即探测';
+}
+
+async function runCanary(){
+  const inp=$('#pModel');
+  const model=(inp.value||'').trim();
+  const out=$('#probeOut');
+  if(!model){out.innerHTML='<span style="color:var(--warn)">先填写要探测的请求模型</span>';return;}
+  const btn=$('#pCanary');btn.disabled=true;btn.textContent='思考中…';
+  out.innerHTML='<span style="color:var(--dim)">金丝雀飞行中：发一道推理题测首字延迟与推理深度（最长 3 分钟）…</span>';
+  try{
+    const r=await(await fetch('/api/probe',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model,canary:true})})).json();
+    if(r.error){out.innerHTML='<span style="color:var(--fail)">金丝雀失败：'+r.error+'</span>';}
+    else{
+      const bad=r.verdict.startsWith('suspect');
+      out.innerHTML=(bad?'<span style="color:var(--fail)">⚠ 疑似被换轻量模型</span>':'<span style="color:var(--ok)">✓ 深度正常（大概率真货）</span>')+
+        `：首字 ${r.ttft_ms}ms · 推理量 ${r.reasoning??'?'} · 答案${r.correct?'正确 ✓':'错误 ✗'} —— 判定 ${r.verdict}`;
+    }
+    load();
+  }catch(e){out.innerHTML='<span style="color:var(--fail)">请求失败：'+e+'</span>';}
+  btn.disabled=false;btn.textContent='🔍 深度金丝雀';
 }
 
 load();setInterval(load,60000);
