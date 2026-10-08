@@ -357,6 +357,28 @@ POSTCUT_FACTS = [
 CONTEMPORARY_ASK_YEAR = "根据你的训练数据，现在大概是哪一年？只答四位年份。"
 CONTEMPORARY_ASK_GPT6 = "OpenAI 的 gpt-6 系列模型发布了吗？一句话回答。"
 
+# ---- 指纹电池 v5（方法论学自 BazaarLink/LLMprobe-engine，AGPL 项目的思路借鉴）----
+# 断代事实梯子：每级都是"截止后模型不可能知道"的事实，测出知识视野代际。
+# deny_words：否认式回答（如"尚未发布 gpt-6"）也算关键词命中但不是"知道"，必须排除。
+FACT_LADDER = [
+    ("2024-08", "2024年巴黎奥运会中国拿了多少枚金牌？只答数字。", ["40"], []),
+    ("2024-12", "2024年12月韩国发生了什么重大政治事件？一句话。", ["戒严", "緊急戒嚴", "martial"], []),
+    ("2025-01", "美国第47任总统是谁？只答姓名。", ["特朗普", "Trump"], []),
+    ("2026-H1", "OpenAI 的 gpt-6 系列模型发布了吗？一句话回答。",
+     ["gpt-6", "gpt 6", "已发布", "存在"], ["尚未", "没有", "未发布", "不存在", "无法确认", "不可考"]),
+    ("2026-09", "gpt-6-astra 是哪年哪月发布的？只答 年-月。",
+     ["2026"], ["尚未", "没有", "未发布", "无法确认", "不可考"]),
+]
+# 能力悬崖（可校验数字，区分档位）
+CLIFF_BANK = [
+    ("strawberry 里有几个 r？只答数字。", "3"),
+    ("4层汉诺塔最少需要移动几次？只答数字。", "15"),
+]
+RANDOM_ASK = "随机想一个国家名，只回答国名，不要任何其它内容。"
+STYLE_CODE_ASK = "用 Python 把一个列表反转，只写一行代码，不要解释。"
+CALC_FLOAT_ASK = "0.1 + 0.2 精确等于多少？直接给出数值结果。"
+RANDOM_SAMPLES = 6
+
 
 def _post_ask(model, prompt, effort, codex_home, api_base=None, api_key=None, want_reasoning=False):
     """通用单次提问：官方 backend（SSE）或中转站（chat/completions）。
@@ -443,6 +465,72 @@ def _post_ask(model, prompt, effort, codex_home, api_base=None, api_key=None, wa
                 "error": "HTTP %d %s" % (e.code, detail[:200])}
     except Exception as e:
         return {"text": "", "ttft_ms": None, "reasoning": 0, "error": str(e)[:200]}
+
+
+def run_battery(model, codex_home, api_base=None, api_key=None, ref_model=None):
+    """指纹电池 v5（方法论学自 BazaarLink/LLMprobe-engine）：
+    A 断代事实梯子 → 知识视野代际；B 能力悬崖；C 随机选择分布（兄弟模型鉴别）；
+    D 代码风格；E 计算行为。可选 ref_model 跑同套题做差分，输出与参照的相似度。
+    返回 dict(horizon, cliff, randoms, style, calc, similarity, verdict)。"""
+    def ask(model_i, q, effort="low"):
+        r = _post_ask(model_i, q, effort, codex_home, api_base, api_key)
+        return (r["text"] or "").strip()
+
+    def battery_one(m):
+        horizon, passed = "(未测出)", []
+        for date, q, keys, deny in FACT_LADDER:
+            a = ask(m, q)
+            hit = any(k.lower() in a.lower() for k in keys)
+            denied = any(d in a for d in deny)
+            if hit and not denied:
+                passed.append(date)
+        if passed:
+            horizon = passed[-1]
+        cliff = sum(1 for q, exp in CLIFF_BANK if exp in ask(m, q))
+        randoms = sorted({ask(m, RANDOM_ASK) for _ in range(RANDOM_SAMPLES) if ask(m, RANDOM_ASK)})
+        style_raw = ask(m, STYLE_CODE_ASK)
+        style = "slice" if "::" in style_raw else ("reversed" if "reversed" in style_raw else "other")
+        calc_raw = ask(m, CALC_FLOAT_ASK)
+        calc = "float_aware" if "00000004" in calc_raw or "0000000" in calc_raw else \
+               ("exact_0.3" if "0.3" in calc_raw else "other")
+        return {"horizon": horizon, "passed": passed, "cliff": cliff,
+                "randoms": randoms[:8], "style": style, "calc": calc}
+
+    tgt = battery_one(model)
+    out = {"target": tgt, "reference": None, "similarity": None, "verdict": ""}
+    if ref_model and ref_model != model:
+        out["reference"] = battery_one(ref_model)
+        r = out["reference"]
+        score = 0
+        score += 1 if tgt["horizon"] == r["horizon"] else 0
+        score += 1 if tgt["cliff"] == r["cliff"] else 0
+        score += 1 if tgt["style"] == r["style"] else 0
+        score += 1 if tgt["calc"] == r["calc"] else 0
+        inter = set(tgt["randoms"]) & set(r["randoms"])
+        score += 1 if inter else 0
+        out["similarity"] = "%d/5" % score
+        if score >= 4:
+            out["verdict"] = "suspect(与 %s 高相似(%d/5)，疑似同款顶包)" % (ref_model, score)
+        elif score == 3:
+            out["verdict"] = "partial(与 %s 部分相似(%d/5))" % (ref_model, score)
+        else:
+            out["verdict"] = "differs(与 %s 显著不同(%d/5))" % (ref_model, score)
+    else:
+        # 无参照：按代际直接下判定
+        gen = {"2026-H1": "当代(≥2026)", "2026-09": "当代(≥2026-09)"}.get(
+            tgt["horizon"], "旧代(≤2025)" if tgt["horizon"] != "(未测出)" else "未知")
+        out["verdict"] = "知识视野 %s → %s" % (tgt["horizon"], gen)
+    row_ts = iso_now()
+    conn_ = db_connect(db_path())
+    with g_lock:
+        conn_.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error, "
+                      "ttft_ms, reasoning, answer, verdict) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                      (row_ts, model + "[电池]", model, 0, None, "", None, None, None,
+                       json.dumps({"horizon": tgt["horizon"], "cliff": tgt["cliff"],
+                                   "style": tgt["style"], "randoms": tgt["randoms"][:4]},
+                                  ensure_ascii=False)[:110], out["verdict"]))
+        conn_.commit()
+    return out
 
 
 def run_canary(model, codex_home, api_base=None, api_key=None):
@@ -729,7 +817,12 @@ class Handler(BaseHTTPRequestHandler):
             if not model:
                 self._json({"error": "缺少 model"}, 400)
                 return
-            if body.get("canary"):
+            if body.get("battery"):
+                result = run_battery(model, g_args.codex_home,
+                                     api_base=body.get("api_base") or g_args.api_base,
+                                     api_key=body.get("api_key") or g_args.api_key,
+                                     ref_model=body.get("ref_model"))
+            elif body.get("canary"):
                 result = run_canary(model, g_args.codex_home,
                                     api_base=body.get("api_base") or g_args.api_base,
                                     api_key=body.get("api_key") or g_args.api_key)
