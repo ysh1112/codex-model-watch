@@ -379,6 +379,103 @@ STYLE_CODE_ASK = "用 Python 把一个列表反转，只写一行代码，不要
 CALC_FLOAT_ASK = "0.1 + 0.2 精确等于多少？直接给出数值结果。"
 RANDOM_SAMPLES = 6
 
+# ---- 精准识别 v6（自采基线 + 统计比对，方法论同 BazaarLink collect-baseline 模式）----
+# 原理：同后端可直接点名请求各候选参照模型 → 对目标与参照跑同一组采样探针，
+# 分类探针比"响应集合重叠度"、数值探针比"分布距离"，最近邻 + 边际裁决；
+# 边际不足时如实 abstain（宁缺勿错）。
+IDENT_RANDOM_PROBES = [
+    "随机想一个国家名，只回答国名。",
+    "随机想一种动物，只回答动物名。",
+    "随机想一个 1-100 之间的整数，只回答数字。",
+]
+IDENT_NUMERIC_PROBE = ("估计这句话有多少个词：\"The quick brown fox jumps over the lazy dog near the river bank today\"，只答数字。", 12)
+IDENT_STYLE_PROBE = "用 Python 把一个列表反转，只写一行代码。"
+IDENT_SAMPLES = 14  # 每个随机探针采样次数
+
+
+def _ident_collect(model, codex_home, api_base, api_key):
+    """对一个模型采集指纹样本。返回 (categorical:{probe:[answers]}, numeric:[...], style_set[...])"""
+    cat = {}
+    for q in IDENT_RANDOM_PROBES:
+        cat[q] = []
+        for _ in range(IDENT_SAMPLES):
+            r = _post_ask(model, q, "low", codex_home, api_base, api_key)
+            t = (r["text"] or "").strip().split("\n")[0][:24]
+            if t:
+                cat[q].append(t)
+    q, _expect = IDENT_NUMERIC_PROBE
+    num = []
+    for _ in range(4):
+        r = _post_ask(model, q, "low", codex_home, api_base, api_key)
+        t = (r["text"] or "").strip()
+        d = "".join(ch for ch in t if ch.isdigit())
+        if d:
+            num.append(int(d[:3]))
+    style = set()
+    for _ in range(3):
+        r = _post_ask(model, IDENT_STYLE_PROBE, "low", codex_home, api_base, api_key)
+        t = r["text"] or ""
+        style.add("slice" if "::" in t else ("reversed" if "reversed" in t else "other"))
+    return cat, num, style
+
+
+def _ident_score(tgt, ref):
+    """目标 vs 参照的综合相似度（0~1）：分类探针=样本落入参照集合的比例；数值=分布贴近；风格=交集。"""
+    parts = []
+    for q, tvals in tgt[0].items():
+        rset = set(ref[0].get(q, []))
+        if not tvals or not rset:
+            continue
+        hit = sum(1 for v in tvals if v in rset) / len(tvals)
+        parts.append(hit)
+    cat_score = sum(parts) / len(parts) if parts else 0.5
+    if tgt[1] and ref[1]:
+        mt, mr = sum(tgt[1]) / len(tgt[1]), sum(ref[1]) / len(ref[1])
+        spread = max(4.0, max(tgt[1] + ref[1]) - min(tgt[1] + ref[1]))
+        num_score = max(0.0, 1.0 - abs(mt - mr) / spread)
+    else:
+        num_score = 0.5
+    style_score = 1.0 if (tgt[2] & ref[2]) else 0.0
+    return round(0.55 * cat_score + 0.25 * num_score + 0.20 * style_score, 3), \
+        {"cat": round(cat_score, 2), "num": round(num_score, 2), "style": round(style_score, 2)}
+
+
+def run_identify(model, codex_home, api_base=None, api_key=None,
+                 refs=("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.5", "gpt-5.6-sol")):
+    """精准识别：目标 vs 各参照，输出排名与最近邻判定。边际 <0.08 时 abstain。"""
+    tgt = _ident_collect(model, codex_home, api_base, api_key)
+    ranking = []
+    for ref in refs:
+        try:
+            rc = _ident_collect(ref, codex_home, api_base, api_key)
+            s, detail = _ident_score(tgt, rc)
+            ranking.append({"ref": ref, "score": s, "detail": detail})
+        except Exception as e:
+            ranking.append({"ref": ref, "score": None, "detail": {"err": str(e)[:80]}})
+    ranking.sort(key=lambda x: -(x["score"] or 0))
+    ok = [r for r in ranking if r["score"] is not None]
+    if not ok:
+        verdict = "error(参照全部采集失败)"
+    else:
+        top, second = ok[0], (ok[1] if len(ok) > 1 else None)
+        margin = (top["score"] - second["score"]) if second else 1.0
+        if top["score"] >= 0.55 and margin >= 0.08:
+            verdict = "最像 %s（%.0f%%，领先第二名 %+.3f）" % (top["ref"], top["score"] * 100, margin)
+        elif top["score"] < 0.55:
+            verdict = "无法判定（最高相似 %s 仅 %.0f%%，候选库可能不含真实模型）" % (top["ref"], top["score"] * 100)
+        else:
+            verdict = "abstain（%s 与 %s 过于接近 %.3f/%.3f）" % (top["ref"], second["ref"], top["score"], second["score"])
+    row_ts = iso_now()
+    conn_ = db_connect(db_path())
+    with g_lock:
+        conn_.execute("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error, "
+                      "ttft_ms, reasoning, answer, verdict) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                      (row_ts, model + "[识别]", model, 0, None, "", None, None, None,
+                       json.dumps([(r["ref"], r["score"]) for r in ok], ensure_ascii=False)[:110],
+                       "identify: " + verdict))
+        conn_.commit()
+    return {"target": model, "ranking": ranking, "verdict": verdict}
+
 
 def _post_ask(model, prompt, effort, codex_home, api_base=None, api_key=None, want_reasoning=False):
     """通用单次提问：官方 backend（SSE）或中转站（chat/completions）。
