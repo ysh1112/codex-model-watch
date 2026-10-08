@@ -342,6 +342,14 @@ QS_SELFKNOW = ("Answer in 3 short lines, no preamble: (1) Your exact underlying 
 LEGACY_NAME_PAT = r"(o1|o3|o4-mini|gpt-4|4o\b)"   # 自报含旧代名 → 旧壳指纹
 LEGACY_CUTOFF_PAT = r"20(1[0-9]|2[0-3])"          # cutoff ≤2023-xx → 旧壳指纹（2024-06 为灰区另行加权）
 
+# 知识截止实测（2026-10-08 加入，比自报可靠）：真 2024-06 旧壳答不出截止后的事实，
+# 而"自报 cutoff 2024-06"被证实常是幻觉套话（本地真 6.1-sol 也这么自报过）。
+# 每条 = (题目, 判对关键词列表, 截止后日期)；答对任一条即证明训练数据 ≥ 该日期。
+POSTCUT_FACTS = [
+    ("2024年巴黎奥运会中国拿了多少枚金牌？只答数字。", ["40"], "2024-08"),
+    ("美国第47任总统是谁（2025年1月就职）？只答姓名。", ["特朗普", "Trump"], "2025-01"),
+]
+
 
 def _post_ask(model, prompt, effort, codex_home, api_base=None, api_key=None, want_reasoning=False):
     """通用单次提问：官方 backend（SSE）或中转站（chat/completions）。
@@ -451,6 +459,17 @@ def run_canary(model, codex_home, api_base=None, api_key=None):
             ctx = int(mc.group(1).replace(",", ""))
             if ctx < 200000:
                 legacy_hits.append("ctx=%d" % ctx)
+    # 阶段 1.5：知识截止实测（自报不可靠的兜底——旧壳真的不知道截止后的事）
+    knows_modern = None  # None=没测出，True=知道截止后事实，False=两条都答错
+    for q, keys, after in POSTCUT_FACTS:
+        kp = _post_ask(model, q, "low", codex_home, api_base, api_key)
+        if kp["error"]:
+            continue
+        if any(k.lower() in (kp["text"] or "").lower() for k in keys):
+            knows_modern = True
+            break
+        if knows_modern is None:
+            knows_modern = False
     # 阶段 2：推理金丝雀
     ca = _post_ask(model, CANARY_QUESTION, "high", codex_home, api_base, api_key, want_reasoning=True)
     ttft_ms, reasoning, answer = ca["ttft_ms"], ca["reasoning"], ca["text"]
@@ -462,18 +481,29 @@ def run_canary(model, codex_home, api_base=None, api_key=None):
         fast = (ttft_ms or 0) < CANARY_TTFT_SUSPECT_MS
         # 官方通道有真 reasoning_tokens；中转通道是字符数，阈值放大 5 倍
         shallow = (reasoning or 0) < (CANARY_REASON_SUSPECT * (1 if api_base else 5))
-        # 指纹取不到（自报拒答/无年份/无身份）≠ 真货：2026-10-06 实测假阴性——
-        # 一轮自报全拒答被误判 ok，外部指纹实测仍是 Luna 顶包。指纹缺失只能判 unknown。
-        fingerprint_missing = not legacy_hits and not _re.findall(r"\b(20\d{2})\b", sk_text)
-        if legacy_hits:
-            verdict = "suspect(旧壳:" + "+".join(legacy_hits) + ")"
-        elif fingerprint_missing:
-            verdict = "unknown(自报未取到，深度不可单独定真伪)"
+        # 判定 v3：知识实测最硬——知道截止后事实 = 不是旧壳（自报 2024-06 视为幻觉）；
+        # 答错全部截止后事实 = 旧壳实锤；没测出时才退回自报指纹。
+        if knows_modern is False:
+            verdict = "suspect(旧壳实锤:截止后事实全不知)"
+        elif knows_modern and legacy_hits:
+            # 自报与知识实测矛盾：以知识实测为准，自报降级为幻觉备注
+            verdict = "ok" if (not (fast and shallow) and correct) else \
+                ("suspect(快而浅)" if (fast and shallow) else "ok+答错" if not correct else "ok")
+            verdict += "(自报cutoff为幻觉)"
+        elif legacy_hits:
+            only_cutoff = legacy_hits == ["cutoff≤2024"]
+            if only_cutoff and knows_modern is None:
+                # 自报 cutoff 2024-06 已被证实常为幻觉套话；知识实测没测出时不能仅凭自报定罪
+                verdict = "unknown(仅自报cutoff≤2024，知识实测未出，不定罪)"
+            else:
+                verdict = "suspect(旧壳:" + "+".join(legacy_hits) + ")"
+        elif knows_modern is None and not _re.findall(r"\b(20\d{2})\b", sk_text):
+            verdict = "unknown(指纹与知识实测均未取到)"
         elif fast and shallow:
             verdict = "suspect(快而浅)"
         else:
             verdict = "ok"
-        if not correct:
+        if not correct and "+" not in verdict:
             verdict += "+答错"
     row_ts = iso_now()
     conn_ = db_connect(db_path())
