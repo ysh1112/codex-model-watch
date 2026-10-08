@@ -350,6 +350,13 @@ POSTCUT_FACTS = [
     ("美国第47任总统是谁（2025年1月就职）？只答姓名。", ["特朗普", "Trump"], "2025-01"),
 ]
 
+# 当代号鉴别（2026-10-08 二轮加入，区分"当代旗舰 vs 5.x 系替身"）：
+# 实测被换通道（含本地官方号）自认年份 2024-06/2025、否认 gpt-6 存在、
+# 最新只知 GPT-5 系——而真 6.x 是 2026-09 发布，必然知道自家 gpt-6 系列。
+# 自认年份单独不可信（套话），必须与 gpt-6 存在性事实题交叉判定。
+CONTEMPORARY_ASK_YEAR = "根据你的训练数据，现在大概是哪一年？只答四位年份。"
+CONTEMPORARY_ASK_GPT6 = "OpenAI 的 gpt-6 系列模型发布了吗？一句话回答。"
+
 
 def _post_ask(model, prompt, effort, codex_home, api_base=None, api_key=None, want_reasoning=False):
     """通用单次提问：官方 backend（SSE）或中转站（chat/completions）。
@@ -470,6 +477,22 @@ def run_canary(model, codex_home, api_base=None, api_key=None):
             break
         if knows_modern is None:
             knows_modern = False
+    # 阶段 1.6：当代号鉴别（真 6.x 必知 gpt-6 系列存在；5.x 替身会否认/只知 GPT-5）
+    contemporary = None  # None=未测出，True=当代号，False=5.x 系替身
+    yr = _post_ask(model, CONTEMPORARY_ASK_YEAR, "low", codex_home, api_base, api_key)
+    g6 = _post_ask(model, CONTEMPORARY_ASK_GPT6, "low", codex_home, api_base, api_key)
+    year_claim = ""
+    if not yr["error"]:
+        import re as _re2
+        ym = _re2.search(r"(20\d{2})", yr["text"] or "")
+        year_claim = ym.group(1) if ym else ""
+    g6_text = "" if g6["error"] else (g6["text"] or "")
+    g6_exists = any(k in g6_text.lower() for k in ("gpt-6", "gpt 6", "gpt6", "已发布", "存在"))
+    g6_denies = any(k in g6_text for k in ("尚未", "没有", "未发布", "不存在", "无法确认"))
+    if g6_denies:
+        contemporary = False
+    elif g6_exists:
+        contemporary = True
     # 阶段 2：推理金丝雀
     ca = _post_ask(model, CANARY_QUESTION, "high", codex_home, api_base, api_key, want_reasoning=True)
     ttft_ms, reasoning, answer = ca["ttft_ms"], ca["reasoning"], ca["text"]
@@ -485,6 +508,11 @@ def run_canary(model, codex_home, api_base=None, api_key=None):
         # 答错全部截止后事实 = 旧壳实锤；没测出时才退回自报指纹。
         if knows_modern is False:
             verdict = "suspect(旧壳实锤:截止后事实全不知)"
+        elif contemporary is False:
+            v = "suspect(非当代号:否认gpt-6"
+            v += "/自认%s" % year_claim if year_claim else ""
+            v += "，为5.x系替身)"
+            verdict = v
         elif knows_modern and legacy_hits:
             # 自报与知识实测矛盾：以知识实测为准，自报降级为幻觉备注
             verdict = "ok" if (not (fast and shallow) and correct) else \
